@@ -1,0 +1,8 @@
+.tools/
+.venv/
+models/
+index/
+logs/
+eval/results/
+__pycache__/
+claude_config_step*.json
