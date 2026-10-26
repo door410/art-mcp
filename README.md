@@ -18,13 +18,16 @@
 | `check_env.py` | 檢查環境，並產生要貼進 Claude 的設定檔 | 階段 2 |
 | `data/artworks/*.json` | 作品資料（格式和小組 `kb/artworks/` 相同） | A1 |
 | `data/images/*.jpg` | 作品圖片 | A1 |
+| `data/draft/` | 20 件臺灣民間藝術（已抓取、**尚待人工抽查**），抽查後搬到 `data/artworks/`；抓取紀錄見裡面的 `README_抓取紀錄.md` | A1、階段 3 |
+| `download_images.py`／`.bat` | 雙擊下載作品圖片到 `data/images/`（轉 .jpg、長邊最多 1024） | A1、階段 3 |
 | `data/keywords.txt` | 關鍵字加分用的名字清單（可以自己加） | 4-3 |
 | `search.py` | 切段、向量化、搜尋、關鍵字加分 | A2～A4、B3 |
 | `build_index.py`／`.bat` | 雙擊建立索引（第一次會下載模型） | A2～A4 |
 | `server.py` | MCP Server：4 個工具、館藏清單、導覽稿範本、工具呼叫紀錄 | B1～B5 |
 | `test_search.py`／`.bat` | 搜尋小測驗：比較有加分和沒加分的 Top-3 命中率 | 階段 4 |
+| `score.py`／`.bat` | 評估計分：比較「不接 MCP」和「接上 MCP」的回答，產生結果表與圖（`eval/results/report.html`） | 階段 6 |
 | `self_check.py`／`.bat` | 健康檢查：一次測試資料、搜尋、MCP 連線與每個工具 | 全部 |
-| `eval/` | 測驗題目與結果 | 階段 4、6 |
+| `eval/` | 測驗題目與結果（`baseline_questions.csv`：基準測試 10 題） | 階段 3、4、6 |
 | `logs/` | `tool_calls.jsonl`（每次工具呼叫）、`server.log`（Server 狀況） | B4 |
 
 執行後才會出現（不放進 Git）：`.tools/`（uv 和 Python）、`.venv/`（套件）、`models/`（向量模型）、`index/`（索引）。

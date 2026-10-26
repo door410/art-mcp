@@ -13,6 +13,7 @@ search.py：搜尋功能（你的 AI 核心）
 from __future__ import annotations
 
 import contextlib
+import difflib
 import hashlib
 import json
 import os
@@ -36,11 +37,18 @@ KEYWORDS_FILE = ROOT / "data" / "keywords.txt"   # 你可以自己加人名、�
 
 MODEL_NAME = "BAAI/bge-small-zh-v1.5"   # 翻譯員：小型中文向量模型，約 90 MB，輸出 512 個數字
 MAX_CHARS = 300        # 一段最多約 300 字
-TOP_K = 3              # 預設取前 3 段
+TOP_K = 3              # 預設取前 3 段（重複的段落只算一次，見 Searcher.ranked）
 KEYWORD_BONUS = 0.05   # 每對上一個名字加的分數
 MAX_BONUS = 0.10       # 加分上限（避免名字分數蓋過意思分數）
-MIN_SCORE = float(os.environ.get("ARTMCP_MIN_SCORE", 0.45))
-# ↑ 第 1 名低於這個分數，就當作「找不到」（暫定值，階段 4 用真模型校正）
+NEAR_DUP = 0.97        # 兩張卡文字有 97% 以上相同，就當成同一段話（去重用，見 Searcher._near_dup_groups）
+# ↑ 10/26 步驟 7 實驗決定：館方重複段落有的差一兩個字（例如「花」→「黏」），只認「一字不差」會漏掉。
+#   97 張卡兩兩比：館方重複的都在 98.6% 以上；不同作品只是格式像的「基本資料」最高 94.5%，所以線畫在 97%。
+MIN_SCORE = float(os.environ.get("ARTMCP_MIN_SCORE", 0.60))
+# ↑ 第 1 名低於這個分數，就當作「找不到」，一張卡都不交。
+#   10/25 用 Door 出的 25 題校正（原本 0.45 會讓 5 題沒答案的裡有 4 題被說成「找到了」）：
+#   0.60 擋掉 2 題完全離題（0.402、0.583），只漏掉 2 題只打關鍵字的題目；
+#   線畫在離題最高 0.583 和下一題 0.623 中間，兩邊各留約 0.02。
+#   寧可少漏：漏掉＝Claude 什麼都拿不到；同領域沒收、資料沒寫的題目交給 Claude 讀卡後判斷。
 
 LICENSE_WHITELIST = {"CC0", "公有領域", "CC BY 4.0"}   # 和小組資料規格相同
 REQUIRED_FIELDS = ["id", "title", "artist", "date_text", "collection", "image", "source_url", "descriptions"]
@@ -257,6 +265,8 @@ def load_keywords(artworks: dict[str, dict]) -> list[str]:
             line = line.strip()
             if line and not line.startswith("#"):
                 words.add(line)
+    # 「不詳」「未載明…」是館方沒寫時的佔位字，不是名字；放進來的話，問題裡有「不詳」就會讓 12 件版印全部加分
+    words = {w for w in words if not w.startswith(("不詳", "未載明"))}
     return sorted((w for w in words if len(w) >= 2), key=len, reverse=True)
 
 
@@ -278,7 +288,25 @@ class Searcher:
         artworks, _ = load_artworks(data_dir)
         self.keywords = load_keywords(artworks)
         self.stale = self.meta["data_fingerprint"] != data_fingerprint(data_dir)
+        self.dup_group = self._near_dup_groups()     # 每張卡屬於哪一組「同一段話」（啟動時算一次）
         self._embedder: Embedder | None = None   # 第一次搜尋時才載入模型（讓 Server 啟動快一點）
+
+    def _near_dup_groups(self) -> list[int]:
+        """幫每張卡標上組別：文字有 NEAR_DUP 以上相同的卡算同一組（組別＝那組第一張卡的編號）。
+        一字不差的當然也算同一組。只在啟動時比一次（97 張約 4,600 對），之後每次搜尋直接查表。"""
+        groups: list[int] = []
+        for i, p in enumerate(self.passages):
+            group = i
+            for j in range(i):
+                if groups[j] != j:                   # 只跟每組的代表比
+                    continue
+                q = self.passages[j].text
+                if p.text == q or (abs(len(p.text) - len(q)) <= 20 and
+                                   difflib.SequenceMatcher(None, p.text, q).ratio() >= NEAR_DUP):
+                    group = j
+                    break
+            groups.append(group)
+        return groups
 
     @property
     def embedder(self) -> Embedder:
@@ -294,11 +322,12 @@ class Searcher:
         semantic = self.vectors @ q            # 餘弦相似度：兩個長度為 1 的向量相乘再加總
         in_query = [w for w in self.keywords if w in query]
         rows = []
-        for p, sem in zip(self.passages, semantic):
+        for i, (p, sem) in enumerate(zip(self.passages, semantic)):
             full = f"{p.title} {p.artist} {p.topic} {p.text}"
             matched = [w for w in in_query if w in full] if use_bonus else []
             bonus = min(KEYWORD_BONUS * len(matched), MAX_BONUS)
             rows.append({
+                "index": i,                          # 第幾張卡（去重時用來查組別）
                 "passage": p,
                 "semantic": round(float(sem), 4),
                 "bonus": round(bonus, 4),
@@ -308,9 +337,34 @@ class Searcher:
         rows.sort(key=lambda r: r["score"], reverse=True)
         return rows
 
-    def search(self, query: str, top_k: int = TOP_K, use_bonus: bool = True) -> dict:
-        """找出最相關的 top_k 段。第 1 名分數太低時，found=False（老實說找不到）。"""
+    def ranked(self, query: str, use_bonus: bool = True, dedup: bool = True) -> list[dict]:
+        """排好名次的段落。dedup=True 時，同一段話（文字 97% 以上相同）只留分數最高的那張。
+        （10/25 決定搜尋時去重；10/26 步驟 7 實驗後，從「一字不差」放寬成「97% 以上相同」）
+        館方原文本來就重複（例如陳天乞的匠師介紹出現在褒忠祠 4 件作品裡），
+        不去重的話，前 3 名可能是同一段話出現 3 次，等於只給 Claude 1 段資料。
+        被拿掉的那幾張不是丟掉，而是記在留下那張的 also_in：「這段話也出現在哪些作品」。"""
         rows = self.score_all(query, use_bonus=use_bonus)
+        for r in rows:
+            r["also_in"] = []
+        if not dedup:
+            return rows
+        kept: dict[int, dict] = {}          # 組別 → 留下的那一列（rows 已排序，第一次遇到的分數最高）
+        out = []
+        for r in rows:
+            p = r["passage"]
+            g = self.dup_group[r["index"]]
+            first = kept.get(g)
+            if first is None:
+                kept[g] = r
+                out.append(r)
+            elif p.artwork_id != first["passage"].artwork_id and \
+                    p.artwork_id not in [a["artwork_id"] for a in first["also_in"]]:
+                first["also_in"].append({"artwork_id": p.artwork_id, "title": p.title})
+        return out
+
+    def search(self, query: str, top_k: int = TOP_K, use_bonus: bool = True, dedup: bool = True) -> dict:
+        """找出最相關的 top_k 段（重複的段落只算一次）。第 1 名分數太低時，found=False（老實說找不到）。"""
+        rows = self.ranked(query, use_bonus=use_bonus, dedup=dedup)
         best = rows[0]["score"] if rows else 0.0
         found = best >= MIN_SCORE
         results = []
@@ -331,6 +385,7 @@ class Searcher:
                     "source_url": p.source_url,
                     "license": p.license,
                     "attribution": p.attribution,
+                    "also_in": r["also_in"],          # 同一段話也出現在這些作品（館方原文重複）
                 })
         return {"query": query, "found": found, "best_score": best,
                 "threshold": MIN_SCORE, "results": results}
