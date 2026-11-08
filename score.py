@@ -58,13 +58,14 @@ TOOL_MAP = RESULTS / "tool_map_B.csv"
 FIRST_WINDOW = timedelta(minutes=15)   # 第一題往前看多久的工具呼叫
 
 COND_NAME = {"A": "條件 A（不接 MCP）", "B": "條件 B（接上 MCP）"}
-HEADER_HINT = "# 把 Claude 的回答整段貼在這一行下面，然後存檔。（# 開頭的行不會被計分）"
+HEADER_HINT = "# 把 Claude 的回答整段貼在這一行下面，然後存檔。（這一行和上一行不會被計分）"
 
 # 「找不到」的說法：該拒答的題，回答裡有這些就算有拒答（會把對到的字印出來，方便你人工確認）
 REFUSAL_PATTERNS = [
     r"找不到", r"查不到", r"沒有找到", r"未能找到", r"搜尋不到", r"沒有(相關|這筆|這件|此)",
     r"(資料庫|知識庫|館藏|資料)(中|裡|內)?(沒有|並未|未)", r"未收錄", r"沒有收錄", r"不在(資料庫|知識庫|館藏|收錄)",
-    r"無法(確認|提供|回答|找到|查到|查證)", r"沒有.{0,6}(資料|紀錄|記錄|資訊)",
+    r"無法(確認|確定|提供|回答|找到|查到|查證)", r"沒有.{0,6}(資料|紀錄|記錄|資訊)",
+    r"沒(有)?辦法(確認|確定|查到|找到|提供)",   # 10/27 加：A 的 N18、N19 寫「無法確定」「沒有辦法確定」沒被認出來
 ]
 # 異體字：AI 常寫「台灣」「剪粘」，答案寫「臺灣」「剪黏」，算同一個字
 VARIANTS = str.maketrans({"臺": "台", "粘": "黏", "戬": "戩", "裏": "裡", "峯": "峰"})
@@ -84,7 +85,8 @@ def say(msg: str = "") -> None:
 def norm(text: str) -> str:
     """比對前先統一寫法：全形半形一致、去掉空白、英文小寫、異體字換成同一個。"""
     text = unicodedata.normalize("NFKC", text).translate(VARIANTS).lower()
-    return re.sub(r"\s+", "", text)
+    # 10/27 加：引號、粗體符號也去掉（回答寫「壽」字，關鍵字是 壽字，要算對到）
+    return re.sub(r"[\s「」『』“”‘’\"'*]+", "", text)
 
 
 def norm_url(url: str) -> str:
@@ -107,9 +109,15 @@ def read_text(path: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+COMMENT_RE = re.compile(r"^#\s*([A-Z]+\d+)?｜")   # 說明行：「# B01｜題目」「#｜小幫手…」
+
+
 def answer_body(path: Path) -> str:
-    """回答檔去掉 # 開頭的說明行，剩下的才是回答。"""
-    return "\n".join(l for l in read_text(path).splitlines() if not l.lstrip().startswith("#")).strip()
+    """回答檔去掉說明行（# 題號｜…、#｜…、貼上提示），剩下的才是回答。
+    10/27 改：以前所有 # 開頭的行都去掉，但 Claude 的回答常有「## 小標題」，會被誤刪，所以只去掉說明行。"""
+    keep = [l for l in read_text(path).splitlines()
+            if not (COMMENT_RE.match(l.strip()) or l.strip() == HEADER_HINT)]
+    return "\n".join(keep).strip()
 
 
 def pct(x: float | None) -> str:
@@ -246,15 +254,24 @@ def refusal_match(text: str) -> str:
     return ""
 
 
+def scored_keywords(q: dict) -> tuple[list[str], list[str]]:
+    """題目裡已經出現的關鍵字不算分（10/27 加：B09 題目就有「西施」，照抄題目也會得分）。
+    回傳（要計分的關鍵字, 被排除的關鍵字）。"""
+    qn = norm(q["question"])
+    use = [k for k in q["keywords"] if norm(k) not in qn]
+    return use, [k for k in q["keywords"] if k not in use]
+
+
 def score_answer(q: dict, text: str, kb_urls: set[str], kb_by_id: dict[str, set[str]]) -> dict:
     t = norm(text)
-    hits = [k for k in q["keywords"] if norm(k) in t]
-    kw = len(hits) / len(q["keywords"]) if q["keywords"] and not q["refuse"] else None
+    kws, _ = scored_keywords(q)
+    hits = [k for k in kws if norm(k) in t]
+    kw = len(hits) / len(kws) if kws and not q["refuse"] else None
     refusal = refusal_match(text)
     right = set().union(*(kb_by_id.get(i, set()) for i in q["source"])) if q["source"] else set()
     src = check_sources(text, kb_urls, right)
     return {
-        "kw": kw, "hits": hits, "missed": [k for k in q["keywords"] if k not in hits],
+        "kw": kw, "hits": hits, "missed": [k for k in kws if k not in hits],
         "refusal": refusal,
         "refused_ok": (bool(refusal) if q["refuse"] else None),
         "false_refusal": (bool(refusal) and kw == 0) if not q["refuse"] and kw is not None else None,
@@ -467,6 +484,10 @@ def main() -> int:
     qs = load_questions()
     made = make_answer_templates(qs)
     say(f"題目 {len(qs)} 題（eval/questions.csv）")
+    for q in qs:
+        _, dropped = scored_keywords(q)
+        if dropped:
+            say(f"  {q['id']}：關鍵字「{'、'.join(dropped)}」題目裡就有，不計分")
     if made:
         say(f"建立了 {made} 個空白回答檔（eval/answers/A、B），把回答貼進去存檔就好")
     kb_urls, kb_by_id = load_kb()

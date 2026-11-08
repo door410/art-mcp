@@ -13,7 +13,8 @@ import sys
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEMPLATES = ["claude_config_step1_hello.json", "claude_config_step2_full.json"]
+# 10/27：階段 6 起不再加 art-rag-hello（已用 remove_hello.py 拿掉），只加正式的 art-rag
+TEMPLATES = ["claude_config_step2_full.json"]
 
 
 def main():
